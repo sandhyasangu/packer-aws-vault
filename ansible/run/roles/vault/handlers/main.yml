@@ -1,0 +1,12 @@
+---
+- name: reload vault
+  service:
+    name: vault
+    state: reloaded 
+  tags:
+    - rotate-certificate
+
+- name: restart vault
+  service: 
+    name: vault
+    state: restarted

@@ -1,0 +1,29 @@
+## The run directory had been uploaded during the packer build into /opt/packer/ansible
+## and run on every boot. It is not executed during packer build
+
+- name: Vault Playbook
+  hosts: localhost 
+  become: true 
+
+  pre_tasks:
+  - name: Get EC2 metadata
+    ec2_metadata_facts:
+
+  - name: Find AWS environment name 
+    set_fact: 
+      aws_environment: "{{ lookup('aws_ssm', '/aws_environment', region=ansible_ec2_placement_region, decrypt=false ) }}"
+
+  - name: Get EC2 Tags
+    delegate_to: localhost
+    amazon.aws.ec2_tag_info:
+      region: "{{ ansible_ec2_placement_region }}"
+      resource: " {{ ansible_ec2_instance_id }}"
+    register: ec2_tags
+  
+  - name: Get root domain
+    set_fact:
+      domain: "{{ lookup('aws_ssm', '/zone', region=ansible_ec2_plaement_region) }}"
+
+  roles:
+  - roles/vault
+      

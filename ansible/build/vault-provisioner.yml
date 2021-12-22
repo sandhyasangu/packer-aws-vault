@@ -1,0 +1,76 @@
+---
+
+- name: Local AMI Playbook
+  any_errors_fatal: true
+  become: true
+  gather_facts: yes
+  hosts: localhost
+  user: ec2-user
+
+  vars:
+    vault_version: 1.9.2
+    terraform_version: 1.1.2
+
+  tasks:
+  - name: Install Unzip
+    package:
+      name: unzip
+    become: true 
+
+  - name: Download and Install Vault Binary 
+    become: true 
+    unarchive:
+      src: "https://releases.hashicorp.com/vault/{{ vault_version }}/vault_{{vault_version}}_linux_amd64.zip"
+      dest: /usr/bin/
+      remote_src: true
+      mode: 0755
+
+  - name: Download and Install Terraform Binary 
+    become: true 
+    unarchive:
+      src: "https://releases.hashicorp.com/terraform/{{ terraform_version }}/terraform_{{terraform_version}}_linux_amd64.zip"
+      dest: /usr/bin/
+      remote_src: true
+      mode: 0755
+
+  - name: Create Vault User Group
+    become: true
+    group:
+      name: vault
+      state: present
+
+  - name: Create Vault User
+    become: true
+    user:
+      name: vault
+      group: vault
+
+  - name: Copy Vault Systemd Unit
+    become: true
+    copy:
+      src: files/vault_service
+      dest: /usr/lib/systemd/system/vault.service
+      owner: root
+      group: root
+      mode: 0755
+
+## Introducing a mechanism to rotate letsencrypt certs in cases where TLS is not offloaded 
+  - name: Deploy rotate script for letsencrypt 
+    become: true 
+    copy:
+      src: files/rotate-certificate.sh
+      dest: /opt/packer
+      owner: root
+      group: root
+      mode: 0755
+
+## Schedule daily cert rotation using cron
+  - name: Cert rotation Cron
+    become: true 
+    cron:
+      name: run playbook with rotate-certificate tag daily 
+      minute: "{{ 59 | random(seed=inventory_hostname) }}"
+      hour: 0
+      job: /opt/packer/rotate-certificate.sh
+
+  

@@ -1,0 +1,19 @@
+[Unit]
+SourcePath=/opt/vault/bin/vault_startup.sh 
+Description=Customized Vault Startup Configuration
+Before=runlevel2.target
+Before=runlevel3.target
+Before=runlevel4.target
+Before=runlevel5.target
+After=network-online.target
+After=network.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vault/bin/vault_startup.sh 
+PIDFile=/var/run/vault_startup.pid 
+Restart=no 
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

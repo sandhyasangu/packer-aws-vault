@@ -1,0 +1,41 @@
+plugin_directory = "/etc/vault/vault_plugins"  # path of plugin binaries
+
+{% if vault_storage == 'dynamodb' %}
+backend "dynamodb" {
+  ha_enabled = "true"
+  region     = "{{ ansible_ec2_placement_region }}"
+  table      = "{{ vault_dynamo_table }}"
+  redirect_addr = "{{ vault_load_balancer_address }}"
+
+}
+{% elif vault_storage == 'file' %}
+backend "file" {
+  path = "/etc/vault/storage"
+}
+{% endif %}
+
+
+listener "tcp" {
+ address = "0.0.0.0:8200"
+{% if vault_offload_tls %}
+ tls_disable = true
+{% else %}
+ tls_cert_file = "/etc/vault/vault_tls.cert"
+ tls_key_file = "/etc/vault/vault_tls.key"
+{% endif %}
+}
+
+telemetry {
+  statsd_address = "localhost:8125"
+  disable_hostname = true
+}
+
+seal "awskms" {
+  region     = "{{ ansible_ec2_placement_region }}"
+  kms_key_id =  "{{ vault_seal_key }}"
+}
+
+api_addr = "{{ vault_load_balancer_address }}"
+cluster_addr = "{{ vault_addr }}:8201"
+ui = true
+pid_file = "/var/run/vault-server/vault-server.pid"

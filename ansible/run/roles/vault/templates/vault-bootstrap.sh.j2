@@ -1,0 +1,23 @@
+#!/bin/bash -e
+exec > >(tee /var/log/vault-bootstrap.log) 2>&1
+
+{% if vault_offload_tls %}
+export VAULT_ADDR=http://127.0.0.1:8200
+{% else %}
+export VAULT_ADDR=https://vault.{{ zone }}:8200
+{% endif %}
+
+pushd  /opt/packer/terraform/vault-configuration-bootstrap/terraform
+
+terraform init -backend-config=bucket=terraform.{{ ansible_ec2_placement_region }}.{{ zone }} -backend-config=key=vault-configuration-bootstrap/terraform.tfstate -backend-config=encrypt=true \
+    -backend-config=region={{ ansible_ec2_placement_region }} -backend-config=dynamodb_table=terraform.{{ ansible_ec2_placement_region }}.{{zone}}-lock-table
+
+terraform state replace-provider -auto-approve registry.terraform.io/-/vault registry.terraform.io/hashicorp/vault || true
+
+echo "Going to execute terraform plan:"
+terraform plan --var="okta_token={{  lookup('vars', okta_org + '.' + okta_base_url + '.token') | default('undefined') }}" \
+    --var 'okta_org={{ okta_org }}' \
+    --var 'okta_admin_groups=[{{  okta_admin_groups }}]' \
+    --var 'okta_base_url={{ okta_base_url }}' \
+     -out vault.tfplan
+terraform apply vault.tfplan

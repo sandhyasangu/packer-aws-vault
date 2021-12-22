@@ -1,0 +1,286 @@
+---
+## Lets Get some instance metadata
+- name: Get EC2 instance metadata
+  action: ec2_metadata_facts
+  tags:
+    - rotate-certificate
+
+## We can also retrieve resource tags that will be used downstream 
+- name: Get EC2 Tags
+  delegate_to: localhost
+  amazon.aws.ec2_tag_info:
+    region: "{{ ansible_ec2_placement_region }}"
+    resource: " {{ ansible_ec2_instance_id }}"
+  register: ec2_tags
+  tags:
+    - rotate-certificate 
+
+# workspace is unique to terraform for the most part. We will be setting workspace when we deploy with terraform
+# we could then use workspace as an additional variable downstream if we so please  
+- name: Set Workspace
+  set_fact:
+    workspace: "{{ ec2_tags.tags.env }}"
+  tags:
+    - rotate-certificate
+
+# In cases where we are deploying for multiple envs (dev, stage and production), we can retrieve aws_environment
+# set with terraform.
+- name: Find AWS environment name 
+  set_fact: 
+    aws_environment: "{{ lookup('aws_ssm', '/aws_environment', region=ansible_ec2_placement_region, decrypt=false | default('', true) ) }}"
+
+## Also set when we deploy resources using terraform, we can retrieve vault load balancer address 
+- name: Set Vault load balancer 
+  set_fact: 
+    vault_load_balancer_address: "{{ lookup('aws_ssm', '/vault_load_balancer', region=ansible_ec2_placement_region ) }}"
+
+## Also set when we deploy resources using terraform, we can retrieve vault seal key
+- name: Set Vault Seal Key 
+  set_fact: 
+    vault_seal_key: "{{ lookup('aws_ssm', '/vault_seal_key', region=ansible_ec2_placement_region ) }}"
+
+## Also set when we deploy resources using terraform, we can retrieve dynamo_db table
+- name: Set Vault Dynamo DB 
+  set_fact: 
+    vault_dynamo_table: "{{ lookup('aws_ssm', '/vault_dynamo_table', region=ansible_ec2_placement_region ) }}"
+
+## Also set when we deploy resources using terraform, we can retrieve the zone
+- name: Set Vault Zone
+  set_fact: 
+    zone: "{{ lookup('aws_ssm', '/zone', region=ansible_ec2_placement_region ) }}"
+  tags:
+    - rotate-certificate
+
+## Also set when runtime configuration S3 bucket. This can be used to pull in runtime config items like
+## Operator PGP Keys
+- name: Set runtime_config_bucket
+  set_fact: 
+    runtime_config_bucket: "{{ lookup('aws_ssm', '/runtime_config_bucket', region=ansible_ec2_placement_region | default('', true)) }}"
+  tags:
+    - rotate-certificate
+
+## If we are going to configure okta integration with vault, this variable can also be retrieved from SSM 
+## assuming its set when terraform deployment runs 
+## Get Okta Base URL 
+- name: Set vault okta_base_url
+  set_fact: 
+    okta_base_url: "{{ lookup('aws_ssm', '/vault/okta_base_url',  region=ansible_ec2_placement_region) | default('okta.com', true) }}"
+
+# Get vault orgs 
+- name: Set vault okta Org
+  set_fact: 
+    okta_base_url: "{{ lookup('aws_ssm', '/vault/okta_org',  region=ansible_ec2_placement_region) | default('gastro', true) }}"
+
+# Get Vault ADMIN Groups
+- name: Set vault Admin Groups
+  set_fact: 
+    okta_base_url: "{{ lookup('aws_ssm', '/okta_admin_groups', region=ansible_ec2_placement_region ) }}"
+
+- name: Set local address
+  set_fact:
+    vault_addr: "http://{{ ansible_ec2_local_ipv4 }}"
+
+- name: Get vault offload TLS 
+  set_fact: 
+    vault_offload_tls: "{{ lookup('aws_ssm', '/vault_offload_tls', region=ansible_ec2_placement_region ) }}"
+  tags:
+    - rotate-certificate
+
+- name: Update host file for Node
+  lineinfile:
+    dest: /etc/hosts
+    line: "127.0.0.1 vault.{{ zone }}"
+    state: present
+
+#### Vault configuration specific items 
+- name: Create vault config directory 
+  become: true
+  file:
+    state: directory 
+    path : /etc/vault
+    mode: 0755
+
+- name: Plugin directory 
+  become: true 
+  file:
+    state: directory 
+    path: /etc/vault/plugins
+    mode: 0755
+
+
+## GITHUB plugins for vault 
+- name: Download file with checksum url (sha256)
+  get_url:
+    url: https://github.com/martinbaillie/vault-plugin-secrets-github/releases/download/v1.3.0/vault-plugin-secrets-github-linux-amd64
+    dest: /etc/vault/vault_plugins/vault-plugin-secrets-github
+    checksum: 'sha256:https://github.com/martinbaillie/vault-plugin-secrets-github/releases/download/v1.3.0/SHA256SUMS'
+    mode: 0755
+  become: true
+
+- name: Download GPG key
+  get_url:
+    url: https://github.com/martinbaillie.gpg
+    dest: /tmp/martinbaillie.gpg
+  become: true
+
+- name: Download signature
+  get_url:
+    url: https://github.com/martinbaillie/vault-plugin-secrets-github/releases/download/v1.3.0/SHA256SUMS.sig
+    dest: /tmp/SHA256SUMS.sig
+  become: true
+
+- name: Download checksum
+  get_url:
+    url: https://github.com/martinbaillie/vault-plugin-secrets-github/releases/download/v1.3.0/SHA256SUMS
+    dest: /tmp/SHA256SUMS
+  become: true
+
+- name: Import GPG key
+  command: "gpg --import /tmp/martinbaillie.gpg"
+  become: true
+
+- name: Verify the authenticity
+  command: "gpg --verify /tmp/SHA256SUMS.sig /tmp/SHA256SUMS"
+
+## If TCP traffic was terminating on the load balancer, this would not be needed 
+## but here we assume, vault is not offloading TLS so pulling vault cert from S3 
+## certs were pre-generated by lets encrypt either with terraform or some other mechanism
+- name: Download certificate signed by Let's Encrypt
+  become: true
+  aws_s3:
+    bucket: "lego-route53-ecs-config.{{ zone }}"
+    object: "/.lego/certificates/_.{{ zone }}.crt"
+    dest: /tmp/vault_tls.cert
+    mode: get
+  when: not vault_offload_tls
+  tags:
+    - rotate-certificate
+
+- name: Deploy /tmp/vault_tls.cert
+  copy:
+    src: /tmp/vault_tls.cert
+    dest:  /etc/vault/vault_tls.cert
+    owner: vault
+    group: vault
+    mode: 0644
+  notify: reload vault
+  when: not vault_offload_tls
+  tags:
+    - rotate-certificate
+
+# TODO: Remove workaround for FIPS mode
+- name: Delete tmp vault tls cert
+  file:
+    path: /tmp/vault_tls.cert
+    state: absent
+  tags:
+    - rotate-certificate
+
+- name: Download private key for certificate signed by Let's Encrypt
+  become: true
+  aws_s3:
+    bucket: "lego-route53-ecs-config.{{ zone }}"
+    object: "/.lego/certificates/_.{{ zone }}.key"
+    dest: /tmp/vault_tls.key
+    mode: get
+  when: not vault_offload_tls
+  tags:
+    - rotate-certificate
+
+- name: Deploy /etc/vault/vault_tls.key
+  copy:
+    src: /tmp/vault_tls.key
+    dest:  /etc/vault/vault_tls.key
+    owner: vault
+    group: vault
+    mode: 0600
+  notify: reload vault
+  when: not vault_offload_tls
+  tags:
+    - rotate-certificate
+
+- name: Delete tmp vault tls key
+  file:
+    path: /tmp/vault_tls.key
+    state: absent
+  tags:
+    - rotate-certificate
+
+- name: Enable Vault Service
+  tags: configuration
+  service:
+    enabled: yes
+    name: vault-server
+
+- name: Update Vault Config
+  template:
+    dest: "/etc/vault/vaultconfig.hcl"
+    owner: root
+    group: root
+    mode: 0644
+    src: vaultconfig.hcl.j2
+  notify: restart vault
+  become: true
+  tags:
+  - configuration
+
+- name: Create Vault Init Script
+  template:
+    src: vault-init.sh.j2
+    dest: /etc/vault/vault-init.sh
+    owner: root
+    group: root
+    mode: 0755
+
+
+- name: Create Vault Bootstrap Script
+  template:
+    dest: "/etc/vault/vault-bootstrap.sh"
+    # only copy file if the destination does not exist
+    force: no
+    owner: root
+    group: root
+    mode: 0755
+    src: vault-bootstrap.sh.j2
+
+- name: Place Vault Logrotate config file under /etc/vault
+  become: true
+  template:
+    backup: false
+    src: logrotate.conf.j2
+    dest: "/etc/logrotate.d/vault-audit-rotate"
+    group: root
+    owner: root
+    mode: 0644
+  tags:
+    - configuration
+
+- name: Call logrotate every hour
+  become: true
+  template:
+    backup: false
+    src: logrotate-hourly.sh.j2
+    dest: "/etc/cron.hourly/logrotate"
+    group: root
+    owner: root
+    mode: 0700
+  tags:
+    - configuration
+
+- name: Create vault pidfile directory
+  file:
+    state: directory
+    path: /var/run/vault-server
+    owner: vault
+    group: vault
+    mode: 0775
+  become: true
+
+- name: Start Vault
+  service:
+    name: vault
+    state: started
+
+- name: Store Vault Token
+  command: /etc/vault/vault-init.sh
+  become: true

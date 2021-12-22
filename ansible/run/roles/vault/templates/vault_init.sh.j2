@@ -1,0 +1,79 @@
+#!/bin/bash -e
+# Store off run into logs
+
+# H/T https://stackoverflow.com/a/17841619/252402
+function join_by { local IFS="$1"; shift; echo "$*"; }
+
+exec > >(tee -a /var/log/vault-init.log) 2>&1
+
+## Differentiate between offloading TLS to loadbalancer or NOT
+{% if vault_offload_tls %}
+export VAULT_ADDR=http://127.0.0.1:8200
+{% else %}
+export VAULT_ADDR=https://vault.{{ zone }}:8200
+{% endif %}
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+
+
+if vault status; then
+    echo "Vault already unsealed"
+else
+    echo "Waiting for vault to start up"
+    # Vault will return 2 as it's error code when it is up, but sealed
+    retry  -t 10 eval 'vault status;  [ $? -eq 2 ]'
+
+    # even after it is, for some reason it might not be ready to do an operator init
+    # for a couple more seconds
+    sleep 3
+
+    if vault status; then
+        echo "Vault already unsealed"
+        exit 0
+    fi
+
+    export AWS_DEFAULT_REGION={{ansible_ec2_placement_region}}
+
+    declare -a RECOVERY_KEYS_PGP
+    ## Retrieve Operator recovery keys from parameter store
+    KEY_FILE_STR=$(/usr/local/bin/aws  \
+     ssm get-parameter --name "/pgp_recovery_key_files" \
+     | jq -r .Parameter.Value)
+    IFS=', ' read -r -a KEY_FILES <<< "$KEY_FILE_STR"
+
+    ## Copy the keys to a runtime configuration S3 bucket 
+    for file in ${KEY_FILES[@]}; do
+        aws s3 cp s3://{{ runtime_config_bucket }}/$file .
+        RECOVERY_KEYS_PGP+=($(basename $file))
+    done
+
+    # Have to comment out the jinja comment section because that's also how
+    #we tell bash to get the length of something
+    VAULT_PGP_RECOVERY_KEY_COUNT=${{ '{#' }}RECOVERY_KEYS_PGP[@]}
+    # e.g. if we have 5 pgp recovery keys, we will need 3 to unseal
+    RECOVERY_THRESHOLD=$(($VAULT_PGP_RECOVERY_KEY_COUNT/2 + 1))
+    PGP_KEYS_ARG=$(join_by "," ${RECOVERY_KEYS_PGP[@]})
+
+    sleep 3
+
+    # One last check to diminish collisions
+    if vault status; then
+        echo "Vault already unsealed"
+        exit 0
+    fi
+
+    VAULT_KEYS=$(vault operator init  -tls-skip-verify -recovery-pgp-keys=$PGP_KEYS_ARG -recovery-shares=$VAULT_PGP_RECOVERY_KEY_COUNT -recovery-threshold=$RECOVERY_THRESHOLD -format=json)
+    export VAULT_TOKEN=$(echo $VAULT_KEYS | jq -r '.root_token')
+    for i in $(seq 0 $(($VAULT_PGP_RECOVERY_KEY_COUNT -1))); do
+        RECOVERY_KEY=$(echo $VAULT_KEYS | jq -r ".recovery_keys_b64[$i]")
+        /usr/local/bin/aws ssm put-parameter --name "/recovery_keys_$i" --value $RECOVERY_KEY --type SecureString --overwrite
+    done
+
+    # Vault still needs a bit more time to be able to use all it's secret's engines
+    echo "Waiting a bit for vault initialization to finish"
+    retry -x 10 vault secrets list
+
+    $DIR/vault-bootstrap.sh || exit $?
+
+    vault token revoke $VAULT_TOKEN
+    # Recovery key doesn't need to be written out to parameter store because AWS KMS is used to store the unseal key.
+fi

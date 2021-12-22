@@ -1,0 +1,14 @@
+### MANAGED BY PACKER/ANSIBLE
+## Logrotate for vault audit logs 
+/var/log/vault-audit.log {
+    weekly 
+    compress
+    copytruncate
+    maxsize 1G
+    size 1G
+    create 0644 vault vault
+    rotate 1
+    postrotate
+        /usr/bin/systemctl reload vault 2> /dev/null || true
+    endscript
+}

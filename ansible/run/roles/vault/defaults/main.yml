@@ -1,0 +1,11 @@
+vault_version: 1.8.5
+
+vault_dynamo_table:
+
+vault_seal_key:
+
+vault_storage: dynamodb
+
+vault_tls_key:
+
+vault_tls_cert:
